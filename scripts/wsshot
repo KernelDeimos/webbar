@@ -1,0 +1,12 @@
+#!/bin/sh
+# wsshot FILE W H X Y — crop a WxH+X+Y region out of an already-captured root image
+# and print it as a base64 JPEG thumbnail (240px wide, q55 ~ 8-15 KB).
+#
+# NB: we crop with `convert`, NOT `import -crop`: `import -window root -crop` ignores the
+# crop and returns the whole root (verified), which squished the entire multi-monitor
+# desktop into every thumbnail. webbar captures the root once per tick (one `import`) then
+# calls this per visible workspace, so the expensive full-screen grab happens only once.
+FILE=$1; W=${2:-0}; H=${3:-0}; X=${4:-0}; Y=${5:-0}
+[ -f "$FILE" ] || exit 0
+[ "$W" -gt 0 ] 2>/dev/null || exit 0
+convert "$FILE" -crop "${W}x${H}+${X}+${Y}" +repage -resize 240x -quality 55 jpg:- 2>/dev/null | base64 -w0

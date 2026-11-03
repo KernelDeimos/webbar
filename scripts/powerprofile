@@ -1,0 +1,9 @@
+#!/bin/sh
+# webbar power-profile module — current profile as a short glyph+label.
+p=$(powerprofilesctl get 2>/dev/null)
+case "$p" in
+  performance) printf '🚀 perf' ;;
+  balanced)    printf '⚖ bal' ;;
+  power-saver) printf '🍃 save' ;;
+  *)           printf '%s' "${p:-?}" ;;
+esac

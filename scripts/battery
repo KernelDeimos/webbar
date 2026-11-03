@@ -1,0 +1,17 @@
+#!/bin/sh
+# webbar battery module — icon + charge percent (plain text, no markup).
+# Uses the first battery found under /sys/class/power_supply (BAT0, BAT1, …).
+B=""
+for d in /sys/class/power_supply/BAT*; do
+  [ -r "$d/capacity" ] && { B="$d"; break; }
+done
+[ -z "$B" ] && { printf 'n/a'; exit 0; }
+cap=$(cat "$B/capacity" 2>/dev/null); st=$(cat "$B/status" 2>/dev/null)
+[ -z "$cap" ] && { printf 'n/a'; exit 0; }
+case "$st" in
+  Charging)               ic="⚡" ;;
+  Full|"Not charging")    ic="🔌" ;;   # plugged in, not drawing
+  Discharging)            ic="🔋" ;;
+  *)                      ic="🔋" ;;
+esac
+printf '%s %s%%' "$ic" "$cap"

@@ -1,0 +1,635 @@
+<!doctype html>
+<html lang="en">
+
+<head>
+  <meta charset="utf-8">
+  <style>
+    /* The bar is a transparent web page hosted in a borderless GTK dock window.
+     Everything here is normal CSS — restyle freely; this is the whole point. */
+    :root {
+      --fg: #e6edf3;
+      --muted: #9aa4b2;
+      --accent: #8ab4ff;
+      --pill: #1b2230cc;
+      --pill-line: #2b3648;
+      --good: #5fbf7a;
+      --warn: #e0b24a;
+      --bad: #e5675c;
+      --angle: 20deg;
+
+    }
+
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0
+    }
+
+    html,
+    body {
+      height: 100%;
+      overflow: hidden;
+      /* background: rgba(0,255,0,0.3); */
+      /* backdrop-filter: blur(5px); */
+      /* background: rgba(0,0,0,0.9); */
+      background: rgba(66, 66, 66, 0.9);
+    }
+
+    body {
+      background: color-mix(in srgb, var(--accent) 20%, transparent);
+      font: 600 13px/1 "Noto Sans", system-ui, sans-serif;
+      color: var(--fg);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      /* gap: 10px; */
+      /* gap: 0px; */
+      padding: 0 20px;
+      -webkit-user-select: none;
+      user-select: none;
+      /* a subtle translucent bar backdrop — tune the alpha or drop it for full glass */
+      /* background:linear-gradient(180deg,#0d1117e6,#0d1117bf); */
+    }
+
+    /* This monitor holds the active workspace → whole bar gets `.bar-active`.
+       Default: a thin accent line along the top + a faint tint. Restyle freely. */
+    body.bar-active {
+      /* box-shadow: inset 0 2px 0 var(--accent); */
+      /* background: linear-gradient(180deg, #8ab4ff14, transparent 60%); */
+      /* background: color-mix(in srgb, var(--accent) 31.5%, transparent); */
+      /* background: rgba(0, 255, 0, 0.3); */
+      background: rgba(79, 112, 101, 0.9);
+    }
+
+    .left,
+    .right {
+      display: flex;
+      align-items: center;
+      /* gap: 7px; */
+      min-width: 0
+    }
+
+    .right {
+      gap: 9px
+    }
+
+    /* #workspaces is a child of .left (alongside the logo) — keep the workspace
+       items in a horizontal row. */
+    #workspaces {
+      display: flex;
+      align-items: center;
+      min-width: 0;
+    }
+
+    /* ---- workspaces: emoji as a big translucent background, number on top ---- */
+    .ws {
+      position: relative;
+      display: inline-grid;
+      place-items: center;
+      min-width: 50px;
+      /* height: 26px; */
+      height: 100vh;
+      /* padding: 0 7px; */
+      /* border-radius: 8px; */
+      cursor: pointer;
+      color: var(--muted);
+      transition: color .12s, transform .08s;   /* background dropped: the shine no longer lives here (see .ws::before) */
+      border: 1px solid rgba(0, 0, 0, 0.9);
+      background-color: rgba(0, 0, 0, 0.6);
+      overflow: hidden;
+    }
+
+    /* live screenshot of the workspace, painted behind the icon (see webbar WS_SHOTS) */
+    .ws .shot {
+      position: absolute;
+      inset: 0;
+      background-size: cover;
+      background-position: center;
+      opacity: .5;
+      pointer-events: none;
+    }
+
+    .ws.current .shot {
+      opacity: .72;
+    }
+
+    .ws .ico {
+      position: absolute;
+      inset: 0;
+      display: grid;
+      place-items: center;
+      font-size: 40px;
+      opacity: .85;
+      /* filter: saturate(1.1) sepia(20%); */
+      /* filter: brightness(40%); */
+      color: var(--accent);
+      margin-top: -5px;
+      /* transformYep: rotateZ(15deg); */
+      pointer-events: none;
+      /* icons may be emoji OR Nerd-Font PUA glyphs (e.g. workspace "2:") — PUA glyphs
+       need the font named explicitly (fontconfig won't auto-fall-back for PUA). */
+      font-family: "Symbols Nerd Font", "Noto Color Emoji", "Noto Sans", sans-serif;
+    }
+
+    .ws .num {
+      opacity: 0.7;
+      position: relative;
+      z-index: 1;
+      font-size: 16px;
+      font-weight: 800;
+      text-shadow: 0 1px 2px #000a;
+      background: rgba(0, 0, 0, 0.5);
+      border-radius: 5px;
+      padding: 2px;
+    }
+
+    /* Win7-style radial shine that follows the cursor (JS sets --mx/--my in px).
+       Perf: instead of a moving radial-gradient (which repaints the element every
+       pointermove — paint-bound on this translucent webkit surface, and eased by the
+       old `transition: background`), the shine is a STATIC pre-rendered radial sprite
+       (::before, rasterized once) that we only TRANSLATE on the GPU to chase the
+       cursor. That's a composite, not a repaint — cheap, and no trailing lag. */
+    .ws {
+      --mx: 25px;
+      --my: 15px;
+    }
+    .ws::before {
+      content: "";
+      position: absolute;
+      left: 0;
+      top: 0;
+      width: 160px;
+      height: 160px;
+      margin: -80px 0 0 -80px;          /* sprite centred on its own origin → translate == cursor */
+      background: radial-gradient(circle, #ffffff42 0%, #ffffff17 38%, transparent 72%);
+      opacity: 0;
+      transform: translate3d(var(--mx), var(--my), 0);   /* GPU-composited move, no repaint */
+      transition: opacity .12s;
+      will-change: transform, opacity;
+      pointer-events: none;
+      z-index: 0;
+    }
+    .ws:hover::before {
+      opacity: 1;
+    }
+    /* keep the icon + screenshot above the shine, matching the old background-layer look */
+    .ws .shot,
+    .ws .ico {
+      z-index: 1;
+    }
+
+    .ws:hover {
+      color: var(--fg);
+    }
+
+    /* "current" = the workspace visible on THIS monitor (i3 `visible`). Icon + underline
+     show only there. "focused" = the single globally-focused one → a touch brighter. */
+    .ws.current {
+      color: #fff
+    }
+
+    .ws .ico {
+      /* opacity: .7 */
+    }
+
+    .ws.current .ico {
+      /* filter: brightness(40%); */
+      /* opacity: .9 */
+    }
+
+    .ws.current .num {
+      font-size: 10px;
+      position: absolute;
+      text-align: right;
+      bottom: 0;
+      right: 0;
+      background: none;
+    }
+
+    .ws.current::after {
+      /* the "underline" accent on the current workspace */
+      content: "";
+      position: absolute;
+      left: 0px;
+      right: 0px;
+      bottom: -1px;
+      height: 3px;
+      background: var(--accent);
+      border-radius: 2px;
+    }
+
+    .ws.focused .num {
+      text-shadow: 0 0 8px var(--accent), 0 1px 2px #000a
+    }
+
+    .ws.urgent {
+      color: var(--bad);
+      /* attention ripples: the item's OWN outline expands + fades on a loop, so it
+         escapes .ws overflow:hidden. (The "outline trick" — no layout reflow.) */
+      animation: ws-ripple 1.15s ease-out infinite;
+    }
+
+    @keyframes ws-ripple {
+      from {
+        outline: 2px solid var(--bad);
+        outline-offset: -1px;
+      }
+
+      to {
+        outline: 2px solid transparent;
+        outline-offset: 13px;
+      }
+    }
+
+    .ws.urgent .ico {
+      opacity: .5
+    }
+
+    /* i3 mode indicator — hidden in the default mode, a pill otherwise (e.g. RESIZE). */
+    #mode-ind {
+      display: none;
+    }
+
+    #mode-ind.show {
+      display: inline-flex;
+      align-items: center;
+      margin: 0 6px;
+      padding: 2px 9px;
+      border-radius: 6px;
+      background: var(--accent);
+      color: #000;
+      font-weight: 800;
+      font-size: 12px;
+      letter-spacing: .6px;
+      text-transform: uppercase;
+    }
+
+    /* brand: optional wordmark + logo on the left */
+    .bar-brand {
+      display: flex;
+      flex-direction: row;
+      align-items: center;
+      gap: 10px;
+      justify-content: center;
+      line-height: 1;
+      margin: 0 30px 0 6px;
+    }
+
+    .bar-brand-text {
+      font-size: 18px;
+      font-weight: 700;
+      /* font-family: 'Lucida Sans', 'Lucida Sans Regular', 'Lucida Grande', 'Lucida Sans Unicode', Geneva, Verdana, sans-serif; */
+      /* font-family: 'Courier New', Courier, monospace; */
+      letter-spacing: .4px;
+      opacity: .85;
+      white-space: nowrap;
+      margin-bottom: 1px;
+    }
+
+    /* height in vh (relative to the bar/viewport) — always definite, so the SVG can't
+       render at its intrinsic size and shove the text out. Leaves room for the wordmark. */
+    .bar-logo {
+      height: 80vh;
+      width: auto;
+      align-self: center;
+      opacity: .95;
+      pointer-events: none;
+      animation: logo-spin 30s linear infinite;
+    }
+
+    /* slow spin: 1 rev / 30s */
+    @keyframes logo-spin {
+      to {
+        /* transform: rotate(360deg); */
+      }
+    }
+
+    /* ---- indicator pills ---- */
+    .mod {
+      position: relative;
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      height: 24px;
+      /* height: 100vh; */
+      padding: 0 9px;
+      border-radius: 12px;
+      /* border-radius: 5px; */
+
+      /* background: var(--pill); */
+      /* border: 1px solid var(--pill-line); */
+
+      font-variant-numeric: tabular-nums;
+      white-space: nowrap;
+    }
+
+    .mod::before {
+      content: "";
+      position: absolute;
+      inset: -5%;
+      top: -3px;
+      transform: skewX(calc(var(--angle)));
+      background: var(--pill);
+      /* border: 1px solid var(--pill-line); */
+      z-index: -1;
+      /* height: calc(100vh - 2px); */
+      height: calc(100vh + 1px);
+    }
+
+    .mod .k {
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 700
+    }
+
+    .mod.good {
+      border-color: #2e6d3f66
+    }
+
+    .mod.good .v {
+      color: var(--good)
+    }
+
+    .mod.warn::before {
+      border-color: #8a6a1f66
+    }
+
+    .mod.warn .v {
+      color: var(--warn)
+    }
+
+    .mod.bad::before {
+      border-color: #8a332c88;
+      background: #3a1c1acc
+    }
+
+    .mod.bad .v {
+      color: var(--bad)
+    }
+
+    #clock {
+      font-weight: 700;
+      letter-spacing: .02em
+    }
+
+    .dim {
+      color: var(--muted)
+    }
+
+    /* CPU/RAM as two stacked meter bars */
+    .meter {
+      flex-direction: column;
+      gap: 1px;
+      padding: 3px 8px;
+      justify-content: center;
+      border: none;
+      /* drop the pill border/bg around the meters — less crowded */
+      background: none;
+    }
+
+    .meter-row {
+      display: flex;
+      align-items: center;
+      gap: 4px;
+    }
+
+    .meter-k {
+      font-size: 8px;
+      color: var(--muted);
+      width: 7px;
+      text-align: center;
+    }
+
+    .meter-track {
+      width: 46px;
+      height: 5px;
+      background: #0f1116;
+      border-radius: 3px;
+      overflow: hidden;
+    }
+
+    .meter-track>i {
+      display: block;
+      height: 100%;
+      width: 0;
+      background: var(--good);
+      transition: width .3s, background .3s;
+    }
+
+    .meter-track>i.warn {
+      background: var(--warn);
+    }
+
+    .meter-track>i.bad {
+      background: var(--bad);
+    }
+
+    .meter-shift-left {
+      position: relative;
+      left: -3px;
+    }
+
+    .meter-shift-right {
+      position: relative;
+      left: 3px;
+    }
+
+    .clickable {
+      cursor: pointer;
+    }
+
+    .clickable:hover {
+      border-color: var(--accent);
+    }
+
+    /* system-tray: icons rendered from the StatusNotifier host, inline in the bar */
+    #tray {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      height: 100%;
+      margin-right: 6px;
+    }
+
+    .tray-ico {
+      width: 22px;
+      height: 22px;
+      cursor: pointer;
+      object-fit: contain;
+      opacity: .9;
+      transition: opacity .1s, transform .1s;
+    }
+
+    .tray-ico:hover {
+      opacity: 1;
+      transform: scale(1.12);
+    }
+  </style>
+</head>
+
+<body>
+  <div class="left">
+    <div class="bar-brand">
+      <!-- Optional: drop a logo in and point this at it (relative to ui/, or an absolute
+           file:// path). The .bar-logo rule gives it a slow spin — tweak/remove in CSS. -->
+      <!-- <img class="bar-logo" src="logo.svg" alt="" /> -->
+      <span class="bar-brand-text">webbar</span>
+    </div>
+    <div id="workspaces"></div>
+  </div>
+  <div class="right" id="modules">
+    <span id="mode-ind"></span>
+    <div class="mod meter" id="m-cpuram" title="CPU / RAM">
+      <div class="meter-row meter-shift-left"><span class="meter-k">C</span><span class="meter-track"><i
+            id="bar-cpu"></i></span></div>
+      <div class="meter-row"><span class="meter-k">R</span><span class="meter-track"><i id="bar-mem"></i></span></div>
+      <div class="meter-row meter-shift-right"><span class="meter-k">S</span><span class="meter-track"><i
+            id="bar-swap"></i></span></div>
+    </div>
+    <span class="mod" id="m-temp"><span class="k">°</span><span class="v" data-v>–</span></span>
+    <span class="mod" id="m-bat"><span class="v" data-v>–</span></span>
+    <span class="mod clickable" id="m-ppd" title="click to cycle power profile"><span class="v" data-v>–</span></span>
+    <span class="mod" id="m-vol"><span class="k">♪</span><span class="v" data-v>–</span></span>
+    <span class="mod" id="m-disk"><span class="k">💾</span><span class="v" data-v>–</span></span>
+    <!-- system tray: a placeholder the native trayer host is positioned over (primary bar only) -->
+    <div id="tray" hidden></div>
+    <span class="mod dim" id="clock">--:--:--</span>
+  </div>
+
+  <script>
+    // ---- clock (pure client-side, no backend round-trip) ----
+    function tick() {
+      var d = new Date();
+      var p = function (n) { return (n < 10 ? "0" : "") + n; };
+      document.getElementById("clock").textContent =
+        d.toLocaleDateString(undefined, { weekday: "short" }) + " " + p(d.getDate()) + " " + (d.getMonth() + 1) +
+        "  " + p(d.getHours()) + ":" + p(d.getMinutes()) + ":" + p(d.getSeconds());
+    }
+    setInterval(tick, 1000); tick();
+
+    // ---- workspaces (pushed from the Python backend via window.__ws) ----
+    function splitName(name) {
+      // "6:🎤" -> {num:"6", icon:"🎤"} ; "4" -> {num:"4", icon:""}
+      var m = /^([0-9]+)\s*:?\s*(.*)$/.exec(name);
+      if (m) return { num: m[1], icon: (m[2] || "").trim() };
+      return { num: name, icon: "" };
+    }
+    // Per-workspace screenshot backgrounds (pushed from the backend, updated on their own
+    // 1s timer). Kept in a store so a full __ws rebuild (fired on every i3 event) re-applies
+    // them instead of wiping them.
+    window.__wsShotStore = window.__wsShotStore || {};
+    window.__wsShots = function (map) {
+      for (var k in map) {
+        window.__wsShotStore[k] = map[k];
+        var el = document.querySelector('.ws[data-num="' + k + '"] .shot');
+        if (el) el.style.backgroundImage = 'url(' + map[k] + ')';
+      }
+    };
+    window.__ws = function (list) {
+      var box = document.getElementById("workspaces");
+      box.innerHTML = list.map(function (w) {
+        var s = splitName(w.name);
+        var cls = "ws" + (w.current ? " current" : "") + (w.focused ? " focused" : "") + (w.urgent ? " urgent" : "");
+        var ico = s.icon ? '<span class="ico">' + s.icon + '</span>' : '';
+        var shot = window.__wsShotStore[w.num];
+        var shotEl = '<span class="shot"' + (shot ? ' style="background-image:url(' + shot + ')"' : '') + '></span>';
+        return '<span class="' + cls + '" data-num="' + w.num + '" title="' + w.name.replace(/"/g, "&quot;") + '">' +
+          shotEl + ico + '<span class="num">' + s.num + '</span></span>';
+      }).join("");
+    };
+    document.getElementById("workspaces").addEventListener("click", function (e) {
+      var el = e.target.closest(".ws"); if (!el) return;
+      // JS -> Python bridge: ask the backend to switch workspace
+      window.webkit.messageHandlers.bar.postMessage(JSON.stringify({ action: "workspace", num: el.dataset.num }));
+    });
+
+    // Radial shine follows the cursor: set --mx/--my (px within the item) as it moves.
+    document.getElementById("workspaces").addEventListener("pointermove", function (e) {
+      var el = e.target.closest(".ws"); if (!el) return;
+      var r = el.getBoundingClientRect();
+      el.style.setProperty("--mx", (e.clientX - r.left) + "px");
+      el.style.setProperty("--my", (e.clientY - r.top) + "px");
+    });
+
+    // ---- i3 mode indicator (pushed from backend: window.__mode(name)) ----
+    window.__mode = function (name) {
+      var el = document.getElementById("mode-ind");
+      if (!el) return;
+      if (name && name !== "default") { el.textContent = name; el.classList.add("show"); }
+      else { el.textContent = ""; el.classList.remove("show"); }
+    };
+
+    // ---- indicator modules (pushed from backend: window.__mod(name, text)) ----
+    function levelFor(name, num) {
+      if (num == null || isNaN(num)) return "";
+      if (name === "temp") return num >= 80 ? "bad" : num >= 60 ? "warn" : "good";
+      if (name === "bat") return num <= 15 ? "bad" : num <= 30 ? "warn" : "good"; // low = bad
+      return num >= 85 ? "bad" : num >= 60 ? "warn" : "good"; // cpu/mem %
+    }
+    window.__mod = function (name, text) {
+      var num = parseInt((String(text).match(/\d+/) || [])[0], 10);
+      // cpu, mem & swap render as stacked meter bars (width = value), not text pills
+      if (name === "cpu" || name === "mem" || name === "swap") {
+        var bar = document.getElementById("bar-" + name);
+        if (bar) { bar.style.width = (isNaN(num) ? 0 : Math.min(100, num)) + "%"; bar.className = levelFor(name, num); }
+        return;
+      }
+      var el = document.getElementById("m-" + name); if (!el) return;
+      var v = el.querySelector("[data-v]"); if (v) v.textContent = text;
+      el.classList.remove("good", "warn", "bad");
+      var lvl = levelFor(name, num); if (lvl) el.classList.add(lvl);
+    };
+
+    // click the power-profile pill to cycle profiles (backend runs powerprofilesctl)
+    (function () {
+      var p = document.getElementById("m-ppd");
+      if (p) p.addEventListener("click", function () {
+        try { window.webkit.messageHandlers.bar.postMessage(JSON.stringify({ action: "ppd-cycle" })); } catch (e) { }
+      });
+    })();
+
+    // ---- this monitor holds the globally-active workspace: toggle a body class ----
+    window.__barActive = function (on) {
+      document.body.classList.toggle("bar-active", !!on);
+    };
+
+    // ---- system tray: icons come from the Python StatusNotifier host and render here
+    // as HTML. Only the primary bar shows the tray. Click → activate the app over DBus. ----
+    window.__enableTray = function () {
+      var t = document.getElementById("tray");
+      if (t) t.hidden = false;
+    };
+    window.__tray = function (items) {
+      var t = document.getElementById("tray");
+      if (!t) return;
+      t.hidden = false;
+      t.innerHTML = (items || []).map(function (it) {
+        return '<img class="tray-ico" src="' + it.icon + '" title="' +
+          String(it.tooltip || "").replace(/"/g, "&quot;") + '" data-svc="' +
+          String(it.service).replace(/"/g, "&quot;") + '">';
+      }).join("");
+    };
+    document.getElementById("tray").addEventListener("click", function (e) {
+      var img = e.target.closest(".tray-ico"); if (!img) return;
+      try {
+        window.webkit.messageHandlers.bar.postMessage(JSON.stringify({
+          action: "tray-activate", service: img.dataset.svc,
+          x: Math.round(e.screenX), y: Math.round(e.screenY),
+          button: e.button === 2 ? "right" : "left"
+        }));
+      } catch (err) { }
+    });
+    document.getElementById("tray").addEventListener("contextmenu", function (e) {
+      e.preventDefault();
+      var img = e.target.closest(".tray-ico"); if (!img) return;
+      try {
+        window.webkit.messageHandlers.bar.postMessage(JSON.stringify({
+          action: "tray-activate", service: img.dataset.svc,
+          x: Math.round(e.screenX), y: Math.round(e.screenY), button: "right"
+        }));
+      } catch (err) { }
+    });
+  </script>
+</body>
+
+</html>

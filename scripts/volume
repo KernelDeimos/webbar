@@ -1,0 +1,20 @@
+#!/bin/sh
+# webbar volume module — default-sink output volume as a percentage.
+# Tries wpctl (PipeWire), then pactl (PulseAudio), then amixer (ALSA).
+if command -v wpctl >/dev/null 2>&1; then
+  line=$(wpctl get-volume @DEFAULT_AUDIO_SINK@ 2>/dev/null)
+  if [ -n "$line" ]; then
+    case "$line" in *MUTED*) printf 'muted'; exit 0 ;; esac
+    printf '%s' "$(printf '%s' "$line" | awk '{printf "%d%%", $2*100}')"
+    exit 0
+  fi
+fi
+if command -v pactl >/dev/null 2>&1; then
+  v=$(pactl get-sink-volume @DEFAULT_SINK@ 2>/dev/null | grep -oE '[0-9]+%' | head -1)
+  [ -n "$v" ] && { printf '%s' "$v"; exit 0; }
+fi
+if command -v amixer >/dev/null 2>&1; then
+  v=$(amixer get Master 2>/dev/null | grep -oE '[0-9]+%' | head -1)
+  [ -n "$v" ] && { printf '%s' "$v"; exit 0; }
+fi
+printf '?'

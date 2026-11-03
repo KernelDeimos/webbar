@@ -1,0 +1,487 @@
+#!/usr/bin/env python3
+"""webbar — a web-tech status bar (GTK + webkit2gtk, no Electron).
+
+One process drives a borderless, transparent dock bar on every monitor (sharing a
+single web engine to keep memory down). Each bar renders ui/index.html; a small
+backend runs polybar-style `custom/script` modules on intervals and talks to i3
+over its IPC socket for instant workspace updates. Everything visual is plain
+HTML/CSS in ui/ — and it hot-reloads when you save.
+
+    webbar                 # a bar on every monitor
+    webbar DP-2            # only this monitor
+    webbar --stop          # stop a running webbar
+
+Per-monitor position: outputs in BOTTOM_OUTPUTS dock at the bottom, the rest at
+the top. Deps (all present): python-gobject, webkit2gtk-4.1, i3, xprop.
+"""
+import json
+import os
+import re
+import socket
+import struct
+import subprocess
+import sys
+import threading
+import time
+
+# Perf tracing: set WEBBAR_PERF=1 to log timing to /tmp/webbar-perf.log (to pinpoint lag).
+_PERF = os.environ.get("WEBBAR_PERF")
+_PERF_F = open("/tmp/webbar-perf.log", "a", buffering=1) if _PERF else None
+
+
+def perf(msg):
+    if _PERF_F:
+        _PERF_F.write("%.4f %s\n" % (time.monotonic(), msg))
+
+import gi
+gi.require_version("Gtk", "3.0")
+gi.require_version("Gdk", "3.0")
+gi.require_version("WebKit2", "4.1")
+from gi.repository import Gtk, Gdk, GLib, Gio, WebKit2  # noqa: E402
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+sys.path.insert(0, HERE)             # so `import tray` works when run via the bin/ symlink
+UI = os.path.join(HERE, "ui", "index.html")
+HEIGHT = 30                          # base bar height in px (at scale 1.0)
+BOTTOM_OUTPUTS = set()               # output names to dock at the BOTTOM instead of top, e.g. {"DP-2"}
+SCALES = {}                          # per-output zoom for high-DPI displays, e.g. {"eDP-1": 1.6}; default 1.0
+WS_SHOTS = True                      # show a live screenshot behind each workspace icon.
+                                     # Only *visible* workspaces can be captured (i3 unmaps
+                                     # hidden ones); each keeps its last shot as you move
+                                     # around. Flip to False + relaunch to turn it off.
+WS_SHOT_INTERVAL = 5                 # seconds between workspace screenshots (raise to lighten
+                                     # CPU further; 1 was too aggressive).
+WS_ROOT_TMP = "/tmp/.webbar-root.png"  # scratch file: one root grab per tick, cropped per ws
+
+_S = os.path.join(HERE, "scripts")
+MODULES = [
+    {"name": "cpu",  "exec": os.path.join(_S, "cpu"),         "interval": 2},
+    {"name": "mem",  "exec": os.path.join(_S, "mem"),         "interval": 2},
+    {"name": "swap", "exec": os.path.join(_S, "swap"),        "interval": 5},
+    {"name": "temp", "exec": os.path.join(_S, "temp"),        "interval": 30},
+    {"name": "bat",  "exec": os.path.join(_S, "battery"),     "interval": 10},
+    {"name": "ppd",  "exec": os.path.join(_S, "powerprofile"), "interval": 5},
+    {"name": "vol",  "exec": os.path.join(_S, "volume"),      "interval": 2},
+    {"name": "disk", "exec": os.path.join(_S, "disk"),        "interval": 60},
+]
+
+
+# ---- i3 IPC (socket, not subprocess: instant + no fork/exec latency) ------------
+def i3_socket_path():
+    return subprocess.run(["i3", "--get-socketpath"], capture_output=True, text=True).stdout.strip()
+
+
+def i3_connect():
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.connect(i3_socket_path())
+    return s
+
+
+def i3_send(sock, mtype, payload=b""):
+    sock.sendall(b"i3-ipc" + struct.pack("=II", len(payload), mtype) + payload)
+
+
+def i3_recv(sock):
+    def recvall(n):
+        buf = b""
+        while len(buf) < n:
+            c = sock.recv(n - len(buf))
+            if not c:
+                return None
+            buf += c
+        return buf
+    hdr = recvall(14)
+    if hdr is None or hdr[:6] != b"i3-ipc":
+        return None
+    ln = struct.unpack("=I", hdr[6:10])[0]
+    return recvall(ln) if ln else b""
+
+
+# Like i3_recv but also returns the message TYPE, so the event loop can tell a
+# workspace event from a mode event (both come on the same subscribed socket).
+def i3_recv_typed(sock):
+    def recvall(n):
+        buf = b""
+        while len(buf) < n:
+            c = sock.recv(n - len(buf))
+            if not c:
+                return None
+            buf += c
+        return buf
+    hdr = recvall(14)
+    if hdr is None or hdr[:6] != b"i3-ipc":
+        return (None, None)
+    ln, mtype = struct.unpack("=II", hdr[6:14])
+    return (mtype, recvall(ln) if ln else b"")
+
+
+# i3 event message types (high bit set). We subscribe to WORKSPACE + MODE.
+I3_EVENT_WORKSPACE = 0x80000000
+I3_EVENT_MODE = 0x80000002
+
+
+# ---- one bar window on one output ----------------------------------------------
+class Bar:
+    def __init__(self, app, ctx, output, x, y, w, h, bottom, primary=False):
+        self.app = app
+        self.output = output
+        self.x, self.w = x, w
+        self.bottom = bottom
+        self.primary = primary
+        self._ready = False
+        self.scale = SCALES.get(output, 1.0)
+        self.h_px = round(HEIGHT * self.scale)    # window height scales with zoom so content fits
+
+        self.win = Gtk.Window()
+        self.win.set_type_hint(Gdk.WindowTypeHint.DOCK)
+        self.win.set_decorated(False)
+        self.win.set_resizable(False)
+        self.win.set_keep_above(True)
+        self.win.set_skip_taskbar_hint(True)
+        self.win.set_skip_pager_hint(True)
+        self.win.set_accept_focus(False)
+
+        vis = self.win.get_screen().get_rgba_visual()
+        if vis:
+            self.win.set_visual(vis)
+        self.win.set_app_paintable(True)   # required for real transparency
+
+        geom = Gdk.Geometry()
+        geom.min_width = geom.max_width = w
+        geom.min_height = geom.max_height = self.h_px
+        self.win.set_geometry_hints(None, geom, Gdk.WindowHints.MIN_SIZE | Gdk.WindowHints.MAX_SIZE)
+        self.win.set_size_request(w, self.h_px)
+        self.wy = y + h - self.h_px if bottom else y
+        self.win.move(x, self.wy)
+
+        self.web = WebKit2.WebView.new_with_context(ctx)   # shared engine across bars
+        # Let the file:// page load file:// resources (e.g. a logo at an absolute path).
+        try:
+            self.web.get_settings().set_property("allow-file-access-from-file-urls", True)
+        except Exception:
+            pass
+        self.web.set_background_color(Gdk.RGBA(0, 0, 0, 0))
+        if self.scale != 1.0:
+            self.web.set_zoom_level(self.scale)            # scales all bar content (fonts, icons, …)
+        ucm = self.web.get_user_content_manager()
+        ucm.register_script_message_handler("bar")
+        ucm.connect("script-message-received::bar", self.on_message)
+        self.web.load_uri("file://" + UI)
+        self.web.connect("load-changed", self.on_load)
+        self.win.add(self.web)
+
+        self.win.connect("realize", self.on_realize)
+        self.win.show_all()
+
+    def on_realize(self, *_):
+        try:
+            from gi.repository import GdkX11  # noqa
+            xid = self.win.get_window().get_xid()
+        except Exception:
+            return
+        if self.bottom:
+            strut = [0, 0, 0, self.h_px, 0, 0, 0, 0, 0, 0, self.x, self.x + self.w - 1]
+        else:
+            strut = [0, 0, self.h_px, 0, 0, 0, 0, 0, self.x, self.x + self.w - 1, 0, 0]
+        subprocess.run(["xprop", "-id", str(xid), "-f", "_NET_WM_STRUT_PARTIAL", "32c",
+                        "-set", "_NET_WM_STRUT_PARTIAL", ",".join(map(str, strut))], capture_output=True)
+        subprocess.run(["xprop", "-id", str(xid), "-f", "_NET_WM_STRUT", "32c",
+                        "-set", "_NET_WM_STRUT", ",".join(map(str, strut[:4]))], capture_output=True)
+
+    def wy_bottom_reserve(self):
+        return HEIGHT
+
+    def on_load(self, web, event):
+        if event == WebKit2.LoadEvent.FINISHED:
+            self._ready = True
+            self.app.populate(self)
+            self.js("window.__enableTray && window.__enableTray()")   # tray on every monitor
+
+    def js(self, code):
+        if self._ready:
+            self.web.run_javascript(code, None, None, None)
+
+    def set_workspaces(self, wss):
+        self.js("window.__ws(%s)" % json.dumps(wss))
+
+    def set_module(self, name, text):
+        self.js("window.__mod(%s,%s)" % (json.dumps(name), json.dumps(text)))
+
+    def set_bar_active(self, active):
+        self.js("window.__barActive(%s)" % ("true" if active else "false"))
+
+    def on_message(self, ucm, message):
+        try:
+            data = json.loads(message.get_js_value().to_string())
+        except Exception:
+            return
+        if data.get("action") == "workspace" and data.get("num"):
+            self.app.i3_command('workspace number %s' % data["num"])
+        elif data.get("action") == "ppd-cycle":
+            self.app.cycle_power_profile()
+        elif data.get("action") == "tray-activate":
+            self.app.tray_activate(data.get("service"), data.get("x", 0),
+                                   data.get("y", 0), data.get("button", "left"))
+
+
+# ---- the app: shared backend + all bars ----------------------------------------
+class App:
+    def __init__(self, only=None):
+        outs = [o for o in self._outputs() if (not only or o["name"] == only)]
+        ctx = WebKit2.WebContext.new()          # one context/engine shared by every bar
+        try:
+            ctx.set_process_model(WebKit2.ProcessModel.SHARED_SECONDARY_PROCESS)
+        except Exception:
+            pass                                # deprecated on newer webkit — harmless
+        # The primary output hosts the system tray (one tray for the whole session).
+        prim = next((o["name"] for o in outs if o.get("primary")), outs[0]["name"] if outs else None)
+        self.bars = []
+        for o in outs:
+            r = o["rect"]
+            self.bars.append(Bar(self, ctx, o["name"], r["x"], r["y"], r["width"], r["height"],
+                                 bottom=o["name"] in BOTTOM_OUTPUTS, primary=(o["name"] == prim)))
+
+        self.cmd = i3_connect()                 # persistent socket for GET_WORKSPACES / commands
+        self._modcache = {}
+        self._reload_pending = False
+        self._started = False
+
+    def _outputs(self):
+        s = i3_connect()
+        i3_send(s, 3)                            # GET_OUTPUTS
+        outs = json.loads(i3_recv(s))
+        s.close()
+        return [o for o in outs if o.get("active") and not o["name"].startswith("xroot")]
+
+    # Query the full workspace list over the socket (no subprocess → fast + consistent).
+    def workspaces(self):
+        i3_send(self.cmd, 1)                     # GET_WORKSPACES
+        return json.loads(i3_recv(self.cmd))
+
+    def i3_command(self, cmd):
+        # RUN_COMMAND on a short-lived socket (clicks are rare; keeps self.cmd read-clean)
+        s = i3_connect()
+        i3_send(s, 0, cmd.encode())
+        i3_recv(s)
+        s.close()
+
+    def cycle_power_profile(self):
+        # Clicking the power-profile pill cycles save → balanced → perf → save.
+        order = ["power-saver", "balanced", "performance"]
+        try:
+            cur = subprocess.run(["powerprofilesctl", "get"], capture_output=True, text=True).stdout.strip()
+            nxt = order[(order.index(cur) + 1) % len(order)] if cur in order else order[0]
+            subprocess.run(["powerprofilesctl", "set", nxt], capture_output=True)
+        except Exception:
+            pass
+        for m in MODULES:            # refresh the indicator immediately
+            if m["name"] == "ppd":
+                self.run_module(m)
+
+    def start_tray(self):
+        # Pure-Python StatusNotifier host (Gio DBus, no external deps). Icons render as
+        # HTML in the page's #tray slot; clicks call the app back over DBus.
+        try:
+            from tray import TrayHost
+            self._tray = TrayHost(self._push_tray)
+        except Exception as e:
+            self._tray = None
+            perf("tray init failed: %s" % e)
+
+    def _push_tray(self, items):
+        payload = json.dumps(items)
+        for bar in self.bars:            # tray items are global → show on every monitor's bar
+            bar.js("window.__tray && window.__tray(%s)" % payload)
+
+    def tray_activate(self, service, x, y, button):
+        if getattr(self, "_tray", None):
+            self._tray.activate(service, x, y, button)
+
+    def populate(self, bar):
+        # push current state to a (re)loaded bar immediately
+        self._push_ws(only_bar=bar)
+        for name, text in self._modcache.items():
+            bar.set_module(name, text)
+        if not self._started:
+            self._started = True
+            for m in MODULES:
+                self.run_module(m)
+            self.subscribe()
+            self.watch_ui()
+            self.start_tray()
+            self.start_ws_shots()
+
+    def _push_ws(self, only_bar=None):
+        perf("push-start")
+        wss = self.workspaces()
+        perf("query-done")
+        for bar in ([only_bar] if only_bar else self.bars):
+            mine = [{"num": w.get("num"), "name": w.get("name", ""),
+                     "focused": w.get("focused", False), "current": w.get("visible", False),
+                     "urgent": w.get("urgent", False)}
+                    for w in wss if w.get("output") == bar.output]
+            bar.set_workspaces(mine)
+            # This bar's monitor is the active one iff it owns the globally-focused workspace.
+            bar.set_bar_active(any(w["focused"] for w in mine))
+        perf("js-sent")
+
+    # modules
+    def run_module(self, m):
+        # Run the module script ASYNC (Gio.Subprocess) so it never blocks the GTK main
+        # loop. This was THE lag: a cpu sampler that runs ~1s and, run synchronously on
+        # the loop every 2s, froze the whole UI (clock stutter + workspace lag) for ~1s
+        # out of every 2. Async keeps the loop responsive while the script samples.
+        try:
+            proc = Gio.Subprocess.new(["/bin/sh", "-c", m["exec"]], Gio.SubprocessFlags.STDOUT_PIPE)
+            proc.communicate_utf8_async(None, None, self._module_done, m)
+        except Exception:
+            pass
+        GLib.timeout_add_seconds(m["interval"], lambda: (self.run_module(m), False)[1])
+
+    def _module_done(self, proc, result, m):
+        try:
+            ok, out, err = proc.communicate_utf8_finish(result)
+            text = (out.splitlines() or [""])[0].strip() if out else "?"
+        except Exception:
+            text = "?"
+        self._modcache[m["name"]] = text
+        for bar in self.bars:
+            bar.set_module(m["name"], text)
+
+    # workspace screenshots: every 1s, capture each *visible* workspace's area and push it
+    # behind that workspace's icon. Capture runs async (Gio.Subprocess, like modules) so it
+    # never blocks the GTK loop. Hidden workspaces can't be captured (i3 unmaps them), so
+    # they keep whatever shot they last had while visible — thumbnails build up as you move.
+    def start_ws_shots(self):
+        if not WS_SHOTS:
+            return
+        GLib.timeout_add_seconds(max(1, WS_SHOT_INTERVAL), self._ws_shot_tick)
+
+    def _ws_shot_tick(self):
+        try:
+            vis = [w for w in self.workspaces() if w.get("visible")]
+            if not vis:
+                return True
+            self._ws_pending = vis
+            # Capture the whole root ONCE (import -window root ignores -crop, so we can't
+            # grab a sub-region directly), then crop each visible workspace out of that one
+            # file — one full-screen grab per tick instead of one per monitor.
+            p = Gio.Subprocess.new(["/bin/sh", "-c",
+                                    "import -window root -silent %s 2>/dev/null" % WS_ROOT_TMP],
+                                   Gio.SubprocessFlags.NONE)
+            p.wait_async(None, self._ws_root_done)
+        except Exception:
+            pass
+        return True                                  # keep the timer running
+
+    def _ws_root_done(self, proc, result):
+        try:
+            proc.wait_finish(result)
+        except Exception:
+            return
+        for w in getattr(self, "_ws_pending", []):
+            r = w.get("rect") or {}
+            gw = int(r.get("width", 0) or 0)
+            if gw <= 0:
+                continue
+            args = [os.path.join(_S, "wsshot"), WS_ROOT_TMP, str(gw),
+                    str(int(r.get("height", 0) or 0)), str(int(r.get("x", 0) or 0)),
+                    str(int(r.get("y", 0) or 0))]
+            p2 = Gio.Subprocess.new(args, Gio.SubprocessFlags.STDOUT_PIPE)
+            p2.communicate_utf8_async(None, None, self._ws_shot_done, w.get("num"))
+
+    def _ws_shot_done(self, proc, result, num):
+        try:
+            ok, out, err = proc.communicate_utf8_finish(result)
+            b64 = (out or "").strip()
+        except Exception:
+            return
+        if not b64:
+            return
+        payload = json.dumps({str(num): "data:image/jpeg;base64," + b64})
+        for bar in self.bars:
+            bar.js("window.__wsShots && window.__wsShots(%s)" % payload)
+
+    # i3 workspace subscription (event socket, instant frames)
+    def subscribe(self):
+        # Register the i3 event socket in the GTK main loop's OWN poll set. The measured
+        # problem: a background thread + cross-thread idle_add did NOT wake the sleeping
+        # main loop (push ran up to ~900ms late). Putting the fd in the loop's poll means
+        # incoming socket data itself wakes the loop and fires on_event on the main thread —
+        # no thread, no cross-thread wakeup, no polling.
+        self.ev = i3_connect()
+        i3_send(self.ev, 2, b'["workspace","mode"]')    # SUBSCRIBE (workspace + mode)
+        GLib.unix_fd_add_full(GLib.PRIORITY_HIGH, self.ev.fileno(),
+                              GLib.IOCondition.IN, self.on_event)
+
+    def on_event(self, fd, cond):
+        mtype, payload = i3_recv_typed(self.ev)
+        if payload is None:
+            return False
+        perf("event-recv")
+        if mtype == I3_EVENT_MODE:
+            try:
+                mode = json.loads(payload).get("change", "default")
+            except Exception:
+                mode = "default"
+            self._push_mode(mode)
+        else:                    # workspace (or anything else) → refresh workspaces
+            self._push_ws()      # already on the main loop → refresh immediately
+        return True
+
+    def _push_mode(self, mode):
+        for bar in self.bars:
+            bar.js("window.__mode && window.__mode(%s)" % json.dumps(mode))
+
+    # hot reload
+    def watch_ui(self):
+        d = Gio.File.new_for_path(os.path.dirname(UI))
+        self._mon = d.monitor_directory(Gio.FileMonitorFlags.WATCH_MOVES, None)
+        self._mon.connect("changed", self.on_ui_changed)
+
+    def on_ui_changed(self, mon, f, other, event):
+        if event in (Gio.FileMonitorEvent.CHANGES_DONE_HINT, Gio.FileMonitorEvent.CREATED,
+                     Gio.FileMonitorEvent.MOVED_IN, Gio.FileMonitorEvent.RENAMED):
+            if not self._reload_pending:
+                self._reload_pending = True
+                GLib.timeout_add(120, self._reload)
+
+    def _reload(self):
+        self._reload_pending = False
+        for bar in self.bars:
+            bar.web.reload()
+        return False
+
+
+def stop_running():
+    me = os.getpid()
+    out = subprocess.run(["pgrep", "-af", "webbar"], capture_output=True, text=True).stdout
+    n = 0
+    for line in out.splitlines():
+        pid = int(line.split()[0])
+        if pid != me and "pgrep" not in line and "python" in line.lower():
+            try:
+                os.kill(pid, 15)
+                n += 1
+            except OSError:
+                pass
+    return n
+
+
+def main():
+    only = None
+    for a in sys.argv[1:]:
+        if a in ("--stop", "--kill"):
+            print(f"stopped {stop_running()} webbar instance(s)")
+            return
+        elif not a.startswith("-"):
+            only = a
+    stop_running()
+    app = App(only)
+    GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, 2, Gtk.main_quit)    # SIGINT (clean Ctrl-C)
+    GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, 15, Gtk.main_quit)   # SIGTERM
+    Gtk.main()
+
+
+if __name__ == "__main__":
+    main()

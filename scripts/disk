@@ -1,0 +1,3 @@
+#!/bin/sh
+# webbar disk module — free space on / (plain).
+printf '%s' "$(df -h / | awk 'NR==2{print $4}')"

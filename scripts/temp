@@ -1,0 +1,15 @@
+#!/bin/sh
+# webbar temperature module — CPU temperature in °C.
+# Prefers /sys thermal zones (no deps); falls back to `sensors`.
+for z in /sys/class/thermal/thermal_zone*/temp; do
+  [ -r "$z" ] || continue
+  t=$(cat "$z" 2>/dev/null)
+  case "$t" in ''|*[!0-9]*) continue ;; esac
+  printf '%d°C' "$((t / 1000))"
+  exit 0
+done
+if command -v sensors >/dev/null 2>&1; then
+  t=$(sensors 2>/dev/null | awk '/^(Package id 0|Tctl|Tdie|temp1):/{gsub(/[+°C]/,"",$2); printf "%d", $2; exit}')
+  [ -n "$t" ] && { printf '%d°C' "$t"; exit 0; }
+fi
+printf 'n/a'
